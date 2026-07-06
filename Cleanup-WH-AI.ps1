@@ -59,13 +59,18 @@ function Remove-Target([string]$path, [string]$label) {
         Write-Host ("  [DRY ] Would delete: {0}" -f $path) -ForegroundColor Yellow
         return
     }
-    try {
-        Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
-        Write-Host ("  [ OK ] Deleted: {0}" -f $path) -ForegroundColor Green
-        $script:nRemoved++
-    } catch {
-        Write-Host ("  [FAIL] Could NOT delete: {0}  ({1})" -f $path, $_.Exception.Message) -ForegroundColor Red
-        $script:nFailed++; $script:failedPaths += $path
+    # Retry: a just-killed process can hold a handle for a moment.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            Write-Host ("  [ OK ] Deleted: {0}" -f $path) -ForegroundColor Green
+            $script:nRemoved++; return
+        } catch {
+            if ($attempt -ge 3) {
+                Write-Host ("  [FAIL] Could NOT delete: {0}  ({1})" -f $path, $_.Exception.Message) -ForegroundColor Red
+                $script:nFailed++; $script:failedPaths += $path
+            } else { Start-Sleep -Milliseconds 700 }
+        }
     }
 }
 
@@ -138,7 +143,27 @@ foreach ($p in $ProcNames) {
         else { $procs | Stop-Process -Force -ErrorAction SilentlyContinue; Write-Host ("  [ OK ] Killed: {0}" -f $p) -ForegroundColor Green }
     } else { Write-Host ("  [ -- ] Not running: {0}" -f $p) -ForegroundColor DarkGray }
 }
-if (-not $DryRun) { Start-Sleep -Milliseconds 800 }  # let file locks release
+
+# Also kill CHILD processes that keep the install folder locked: node.exe running
+# from the app dir (MCP server) + WebView2 hosts using the app's user-data dirs.
+# Strictly scoped to WH-AI paths, so other apps' node/WebView2 are never touched.
+$installRoots = @("$env:LOCALAPPDATA\WOHHUPxAI", "$env:ProgramFiles\WohhupAI", "$env:ProgramW6432\WohhupAI") |
+    Where-Object { $_ }
+try {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+        $mine = $false
+        foreach ($root in $installRoots) {
+            if ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $mine = $true; break }
+        }
+        if (-not $mine -and $_.Name -eq 'msedgewebview2.exe' -and $_.CommandLine -and
+            ($_.CommandLine -match '\\WohhupAI\\' -or $_.CommandLine -match '\\WOHHUPxAI\\')) { $mine = $true }
+        if ($mine) {
+            if ($DryRun) { Write-Host ("  [DRY ] Would kill child: {0} (PID {1})" -f $_.Name, $_.ProcessId) -ForegroundColor Yellow }
+            else { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host ("  [ OK ] Killed child: {0} (PID {1})" -f $_.Name, $_.ProcessId) -ForegroundColor Green } catch {} }
+        }
+    }
+} catch {}
+if (-not $DryRun) { Start-Sleep -Milliseconds 1500 }  # let handles release
 
 # ---- 2. App folders (all 3 generations) ----
 Write-Step "2) App folders"
